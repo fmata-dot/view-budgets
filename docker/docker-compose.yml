@@ -1,0 +1,61 @@
+# Local SQL Server test environment for budget-sync.
+#
+# Usage (run from the project root, not from inside this docker/ folder --
+# --env-file points compose at .env.test, which lives one level up):
+#   cp .env.test.example .env.test          # then fill in a real password
+#   docker compose -f docker/docker-compose.yml --env-file .env.test up -d
+#   docker compose -f docker/docker-compose.yml --env-file .env.test logs -f init
+#
+# One image for both services: mcr.microsoft.com/mssql/server:2022-latest
+# bundles mssql-tools18 (sqlcmd) as of CU14+, so no separate tools image
+# is needed for the init step.
+#
+# On Apple Silicon / Windows on ARM machines: this image is amd64-only.
+# Docker Desktop runs it fine via built-in emulation (just slower to start) --
+# there is no ARM64-native Microsoft SQL Server image. Azure SQL Edge used to
+# fill that gap but was retired on Sept 30, 2025, so amd64 emulation is the
+# only option today. Nothing below needs to change either way -- this is
+# purely a Docker Desktop / host-CPU concern, not a compose config concern.
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: budget-sync-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${TEST_SQL_SA_PASSWORD:?set TEST_SQL_SA_PASSWORD in .env.test}"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: budget-sync-sqlserver-init
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: "${TEST_SQL_SA_PASSWORD:?set TEST_SQL_SA_PASSWORD in .env.test}"
+    volumes:
+      - ../sql:/sql:ro
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        for f in /sql/00_create_database.sql /sql/01_schema.sql /sql/02_upsert_labor_budget.sql /sql/03_upsert_census_budget.sql; do
+          echo "Running $$f ..."
+          /opt/mssql-tools18/bin/sqlcmd -C -S sqlserver -U sa -P "$$MSSQL_SA_PASSWORD" -i "$$f"
+        done
+        echo "Schema + stored procedures loaded."
+
+volumes:
+  sqlserver-data:
